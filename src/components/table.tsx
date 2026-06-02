@@ -20,98 +20,6 @@ import {
 
 
 // 模拟数据（实际项目中替换为你的 API 数据）
-const mockData = [
-  {
-    id: '1',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '2',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '3',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '4',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '5',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '6',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '7',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '8',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '9',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '10',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-  {
-    id: '11',
-    token: 'ETH (2395.123 ) / USDC (23958.97)',
-    free: '1.00%',
-    range: '2421.1866 - 6197.9015',
-    currentprice: '2421.1866',
-    liquidity: '2024'
-  },
-
-  // ... 更多数据
-];
 
 export interface Column {
   key: string;
@@ -124,16 +32,16 @@ export default function DataTable({ data, columns, itemsPerpahe = 5 }) {
 
 
   //如果data有数据就有data的，没用就用mockData的
-  const tableData = data.length > 0 ? data : mockData;
+  const tableData = data
   const [currentPage, setCurrentPage] = useState(1);
 
   // 计算总页数
-  const totalPages = Math.ceil(mockData.length / ITEMS_PER_PAGE);
+  const totalPages = Math.ceil(tableData.length / itemsPerpahe);
 
   // 获取当前页的数据
-  const currentData = mockData.slice(
-    (currentPage - 1) * ITEMS_PER_PAGE,
-    currentPage * ITEMS_PER_PAGE
+  const currentData = tableData.slice(
+    (currentPage - 1) * itemsPerpahe,
+    currentPage * itemsPerpahe
   );
 
   return (
@@ -192,17 +100,62 @@ export default function DataTable({ data, columns, itemsPerpahe = 5 }) {
             />
           </PaginationItem>
 
-          {/* 页码 */}
-          {[...Array(totalPages)].map((_, index) => (
-            <PaginationItem key={index + 1}>
-              <PaginationLink
-                isActive={currentPage === index + 1}
-                onClick={() => setCurrentPage(index + 1)}
-              >
-                {index + 1}
-              </PaginationLink>
-            </PaginationItem>
-          ))}
+          {/* ✅ 智能分页 - 页码过多时用 ... 省略 */}
+          {(() => {
+            const pages: (number | 'ellipsis')[] = [];
+
+            // 始终显示第一页
+            pages.push(1);
+
+            if (totalPages <= 7) {
+              // 总页数 ≤ 7：全部显示
+              for (let i = 2; i < totalPages; i++) {
+                pages.push(i);
+              }
+            } else if (currentPage <= 4) {
+              // 当前页靠左：1 2 3 4 5 ... last
+              for (let i = 2; i <= 5; i++) {
+                pages.push(i);
+              }
+              pages.push('ellipsis');
+            } else if (currentPage >= totalPages - 3) {
+              // 当前页靠右：1 ... last-4 last-3 last-2 last-1 last
+              pages.push('ellipsis');
+              for (let i = totalPages - 4; i < totalPages; i++) {
+                pages.push(i);
+              }
+            } else {
+              // 当前页在中间：1 ... current-1 current current+1 ... last
+              pages.push('ellipsis');
+              pages.push(currentPage - 1);
+              pages.push(currentPage);
+              pages.push(currentPage + 1);
+              pages.push('ellipsis');
+            }
+
+            // 始终显示最后一页（如果不是第1页的话）
+            if (totalPages > 1) {
+              pages.push(totalPages);
+            }
+
+            return pages.map((page, index) =>
+              page === 'ellipsis' ? (
+                <PaginationItem key={`ellipsis-${index}`}>
+                  <PaginationEllipsis />
+                </PaginationItem>
+              ) : (
+                <PaginationItem key={page}>
+                  <PaginationLink
+                    isActive={currentPage === page}
+                    onClick={() => setCurrentPage(page)}
+                  >
+                    {page}
+                  </PaginationLink>
+                </PaginationItem>
+              )
+            );
+          })()}
+
 
           {/* 下一页 */}
           <PaginationItem>
