@@ -19,7 +19,7 @@ import { erc20Abi, formatUnits, type Address, parseUnits } from 'viem'
 
 const PoolManagerAddress = '0xddC12b3F9F7C91C79DA7433D8d212FB78d609f7B'
 /** 请替换为链上已部署的 SwapRouter 地址 */
-const SwapRouterAddress = '0x0000000000000000000000000000000000000000' as Address
+const SwapRouterAddress = '0xD2c220143F5784b3bD84ae12747d97C8A36CeCB2' as Address
 
 type Pair = {
     token0: Address
