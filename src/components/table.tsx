@@ -26,9 +26,29 @@ export interface Column {
   title: string;
 }
 
+type ActionRow = {
+  id: string | number | bigint;
+};
+
+type DataTableProps = {
+  data: any[];
+  columns: Column[];
+  itemsPerpahe?: number;
+  onBurn?: (item: ActionRow) => void;
+  onCollect?: (item: ActionRow) => void;
+  actionLoading?: boolean;
+};
+
 const ITEMS_PER_PAGE = 5;
 
-export default function DataTable({ data, columns, itemsPerpahe = 5 }) {
+export default function DataTable({
+  data,
+  columns,
+  itemsPerpahe = 5,
+  onBurn,
+  onCollect,
+  actionLoading = false,
+}: DataTableProps) {
 
 
   //如果data有数据就有data的，没用就用mockData的
@@ -68,15 +88,17 @@ export default function DataTable({ data, columns, itemsPerpahe = 5 }) {
                     <div className="flex gap-2">
                       <button
                         className="px-3 py-1 text-sm text-blue-500"
-                        onClick={() => console.log('View', item.id)}
+                        disabled={actionLoading}
+                        onClick={() => onBurn ? onBurn(item) : console.log('Burn', item.id)}
                       >
-                        View
+                        Burn
                       </button>
                       <button
                         className="px-3 py-1 text-sm text-blue-500"
-                        onClick={() => console.log('Add', item.id)}
+                        disabled={actionLoading}
+                        onClick={() => onCollect ? onCollect(item) : console.log('Collect', item.id)}
                       >
-                        Add Liquidity
+                        Collect
                       </button>
                     </div>
                   ) : (

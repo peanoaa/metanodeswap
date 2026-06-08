@@ -1,134 +1,215 @@
+import { useMemo } from 'react'
+import { useReadContracts } from 'wagmi'
+import { erc20Abi, formatUnits, type Address } from 'viem'
 
 
-// geAllPool数据类型定义
+
+export function usePoolTokens(pools: PoolRawData[] | undefined) {
+    const contracts = useMemo(() => {
+        if (!pools) return [];
+        return pools.flatMap((p) => [
+            { address: p.token0, abi: erc20Abi, functionName: 'symbol' },
+            { address: p.token1, abi: erc20Abi, functionName: 'symbol' },
+            { address: p.token0, abi: erc20Abi, functionName: 'decimals' },
+            { address: p.token1, abi: erc20Abi, functionName: 'decimals' },
+            { address: p.token0, abi: erc20Abi, functionName: 'balanceOf', args: [p.pool] },
+            { address: p.token1, abi: erc20Abi, functionName: 'balanceOf', args: [p.pool] },
+        ])
+    }, [pools])
+
+    const { data: results, isLoading, error } = useReadContracts({
+        contracts,
+        query: {
+            enabled: !!contracts.length,
+        }
+    })
+
+    console.log(results, '++++++++++++++++++++');
+
+    const rows = useMemo(() => {
+        if (!pools?.length || !results) return []
+
+        return pools.map((p, i) => {
+            const b = i * 6
+            const ok = (idx: number) =>
+                results[idx]?.status === 'success' ? results[idx].result : undefined
+
+            const symbol0 = ok(b + 0) as string | undefined
+            const symbol1 = ok(b + 1) as string | undefined
+            const decimals0 = Number(ok(b + 2) ?? 18)
+            const decimals1 = Number(ok(b + 3) ?? 18)
+            const balance0 = ok(b + 4) as bigint | undefined
+            const balance1 = ok(b + 5) as bigint | undefined
+            const fmt = (sym?: string, bal?: bigint, dec = 18) => {
+                const s = sym ?? '???'
+                if (bal === undefined) return `${s} (—)`
+                const num = Number(formatUnits(bal, dec))
+                const fixed = Number.isFinite(num) ? num.toFixed(2) : '—'
+                return `${s} (${fixed})`
+            }
+            const token = `${fmt(symbol0, balance0, decimals0)} / ${fmt(symbol1, balance1, decimals1)}`
+
+            const feePercent = (p.fee / 10000).toFixed(2) + '%';
+
+            // p.tickLower = Number((1.0001 ** Number(p.tickLower)).toFixed(4))
+            // p.tickUpper = Number((1.0001 ** Number(p.tickUpper)).toFixed(4))
+            const tickLowerPrice = Number((1.0001 ** Number(p.tickLower)).toFixed(4));
+            const tickUpperPrice = Number((1.0001 ** Number(p.tickUpper)).toFixed(4));
+            const pricerange = tickLowerPrice + '-' + tickUpperPrice;
+            const Q96 = Math.pow(2, 96)
+            const currentprice = ((Number(p.sqrtPriceX96) / Q96) ** 2).toFixed(2)
+            return {
+                ...p,
+                token,
+                pricerange,
+                currentprice,
+                feePercent
+
+            }
+        })
+    }, [pools, results])
+
+
+    console.log(rows, '-----------------------------------------');
+    //把rows数据存储到poolsData中
+    poolsData = rows;
+    return { rows, isLoading }
+
+}
+
+// usePoolTokens 写入的池子展示数据，供 Position 页合并
+let poolsData: PoolRowData[] = [];
+
+// // geAllPool数据类型定义
 export interface PoolRawData {
-    fee: number;
-    feeProtocol: number;
-    index: number;
-    liquidity: bigint;
-    pool: string;
-    sqrtPriceX96: bigint;
-    tick: number;
-    tickLower: number;
-    tickUpper: number;
-    token0: string;
-    token1: string;
+    pool: Address
+    token0: Address
+    token1: Address
+    index: number
+    fee: number
+    feeProtocol: number
+    tickLower: number
+    tickUpper: number
+    tick: number
+    sqrtPriceX96: bigint
+    liquidity: bigint
 }
 
-export function transformPoolData(raw: PoolRawData): {
-    id: string;
-    token: string;
-    free: string;
-    range: string;
-    currentprice: string;
-    liquidity: string;
-} {
-    // 1. fee 转百分比：3000 → "0.30%"
-    const feePercent = (raw.fee / 10000).toFixed(2) + '%';
-
-    // 2. sqrtPriceX96 解码为价格
-    const Q96 = Math.pow(2, 96);
-    const price = (Number(raw.sqrtPriceX96) / Q96) ** 2;
-
-    // 3. 格式化流动性
-    const formatLiq = (liq: bigint): string => {
-        const num = Number(liq);
-        if (num >= 1e12) return `${(num / 1e12).toFixed(2)}T`;
-        if (num >= 1e9) return `${(num / 1e9).toFixed(2)}B`;
-        if (num >= 1e6) return `${(num / 1e6).toFixed(2)}M`;
-        if (num >= 1e3) return `${(num / 1e3).toFixed(2)}K`;
-        return num.toLocaleString();
-    };
-
-    // 4. Token 显示（先用地址截断，后续可查名称）
-    const shortenAddress = (addr: string) => 
-        `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-
-    return {
-        id: raw.pool,                    // 用 pool 地址作为 ID
-        token: `${shortenAddress(raw.token0)} / ${shortenAddress(raw.token1)}`,
-        free: feePercent,
-        range: `${raw.tickLower} ~ ${raw.tickUpper}`,
-        currentprice: price.toFixed(2),
-        liquidity: formatLiq(raw.liquidity),
-    };
+export type PoolRowData = PoolRawData & {
+    token: string
+    pricerange: string
+    currentprice: string
+    feePercent: string
 }
 
 
-//getPosition数据类型
+
+
+
+
+// //转成biging
+function toBigInt(v: bigint | string | number): bigint {
+    return typeof v === 'bigint' ? v : BigInt(v)
+}
+// //整理数据格式
+export function normalizePools(pools: unknown): PoolRawData[] {
+    if (!pools) return [];
+    const list = Array.isArray(pools) ? pools : Object.values(pools as Record<string, unknown>);
+    return list.map((raw) => {
+        const item = raw as Record<string, unknown>
+        return {
+            pool: item.pool as Address,
+            token0: item.token0 as Address,
+            token1: item.token1 as Address,
+            index: Number(item.index),
+            fee: Number(item.fee),
+            feeProtocol: Number(item.feeProtocol),
+            tickLower: Number(item.tickLower),
+            tickUpper: Number(item.tickUpper),
+            tick: Number(item.tick),
+            sqrtPriceX96: toBigInt(item.sqrtPriceX96 as bigint | string | number),
+            liquidity: toBigInt(item.liquidity as bigint | string | number),
+        }
+    })
+}
+// //getPosition数据类型
 export interface PositionRawData {
-    owner: string;                    // string 类型
     id: string;                       // position ID (NFT tokenId)
-    owner_address: string;            // owner address
-    token0: string;                   // token0 address
-    token1: string;                   // token1 address
-    index: string;                    // index
-    fee: string;                      // fee (如 "3000" = 0.3%)
-    liquidity: string;                // 流动性数量 (bigint 字符串)
-    tickLower: string;               // 价格下限 tick (可为负数)
-    tickUpper: string;               // 价格上限 tick
-    tokensOwed0: string;             // 待领取的 token0 数量
-    tokensOwed1: string;             // 待领取的 token1 数量
-    feeGrowthInside0LastX128: string;
-    feeGrowthInside1LastX128: string;
+    owner: Address;                    // string 类型
+    token0: Address;                   // token0 address
+    token1: Address;                   // token1 address
+    index: number
+    fee: number;                      // fee (如 "3000" = 0.3%)
+    liquidity: bigint;                // 流动性数量 (bigint 字符串)
+    tickLower: number;               // 价格下限 tick (可为负数)
+    tickUpper: number;               // 价格上限 tick
+    tokensOwed0: bigint;             // 待领取的 token0 数量
+    tokensOwed1: bigint;             // 待领取的 token1 数量
+    feeGrowthInside0LastX128: bigint;
+    feeGrowthInside1LastX128: bigint;
 }
-export interface PositionDisplayData {
-    id: string;
-    token: string;
-    free: string;
-    range: string;
-    liquidity: string;
-    unclaimed: string;           // 未领取代币
-}
-export function transformPositionData(raw: PositionRawData): PositionDisplayData {
-    // 1. fee 转百分比：3000 → "0.30%", 10000 → "1.00%"
-    const feePercent = (Number(raw.fee) / 10000).toFixed(2) + '%';
 
-    // 2. 格式化流动性（支持大数字）
-    const formatLiq = (val: string): string => {
-        const num = Number(val);
-        if (num >= 1e12) return `${(num / 1e12).toFixed(2)}T`;
-        if (num >= 1e9) return `${(num / 1e9).toFixed(2)}B`;
-        if (num >= 1e6) return `${(num / 1e6).toFixed(2)}M`;
-        if (num >= 1e3) return `${(num / 1e3).toFixed(2)}K`;
-        return num.toLocaleString();
-    };
 
-    // 3. Token 地址截断显示
-    const shortenAddress = (addr: string) =>
-        `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-
-    // 4. 格式化未领取代币
-    const formatUnclaimed = (): string => {
-        const t0 = Number(raw.tokensOwed0);
-        const t1 = Number(raw.tokensOwed1);
-        if (t0 === 0 && t1 === 0) return '0';
-        
-        const parts: string[] = [];
-        if (t0 > 0) {
-            if (t0 >= 1e6) parts.push(`${(t0 / 1e6).toFixed(2)}M`);
-            else if (t0 >= 1e3) parts.push(`${(t0 / 1e3).toFixed(2)}K`);
-            else parts.push(t0.toFixed(4));
+export function normalizePosition(pools: unknown): PositionRawData[] {
+    if (!pools) return [];
+    const list = Array.isArray(pools) ? pools : Object.values(pools as Record<string, unknown>);
+    return list.map((raw) => {
+        const item = raw as Record<string, unknown>
+        return {
+            id: item.id as string,
+            owner: item.owner as Address,
+            token0: item.token0 as Address,
+            token1: item.token1 as Address,
+            index: Number(item.index),
+            fee: Number(item.fee),
+            liquidity: toBigInt(item.liquidity as bigint | string | number),
+            tickLower: Number(item.tickLower),
+            tickUpper: Number(item.tickUpper),
+            tokensOwed0:toBigInt(item.tokensOwed0 as bigint | string | number),
+            tokensOwed1:toBigInt(item.tokensOwed1 as bigint | string | number),
+            feeGrowthInside0LastX128:toBigInt(item.feeGrowthInside0LastX128 as bigint | string | number),
+            feeGrowthInside1LastX128:toBigInt(item.feeGrowthInside1LastX128 as bigint | string | number),
         }
-        if (t1 > 0) {
-            if (t1 >= 1e6) parts.push(`${(t1 / 1e6).toFixed(2)}M`);
-            else if (t1 >= 1e3) parts.push(`${(t1 / 1e3).toFixed(2)}K`);
-            else parts.push(t1.toFixed(4));
-        }
-        return parts.join(' / ');
-    };
-
-    return {
-        id: raw.id,                                      // Position ID (NFT ID)
-        token: `${shortenAddress(raw.token0)} / ${shortenAddress(raw.token1)}`,
-        free: feePercent,                                // 费率
-        range: `${raw.tickLower} ~ ${raw.tickUpper}`,   // 价格范围
-        liquidity: formatLiq(raw.liquidity),            // 流动性
-        unclaimed: formatUnclaimed(),                    // 未领取代币
-    };
+    })
 }
 
 
+export type PositionRowData = PositionRawData & {
+    token?: string
+    pricerange?: string
+    currentprice?: string
+    feePercent?: string
+}
 
+function isSamePoolKey(
+    a: { token0: Address; token1: Address; index: number },
+    b: { token0: Address; token1: Address; index: number }
+) {
+    return (
+        a.token0.toLowerCase() === b.token0.toLowerCase() &&
+        a.token1.toLowerCase() === b.token1.toLowerCase() &&
+        a.index === b.index
+    )
+}
 
+/** 用 token0 + token1 + index 与 poolsData 匹配，合并池子展示字段 */
+export function PositionData(positions: PositionRawData[]): PositionRowData[] {
+    if (!positions?.length) return []
 
+    return positions.map((pos) => {
+        const { token0, token1, index } = pos
+        const pool = poolsData.find((p) => isSamePoolKey(p, { token0, token1, index }))
+
+        if (!pool) {
+            return { ...pos }
+        }
+
+        return {
+            ...pos,
+            token: pool.token,
+            pricerange: pool.pricerange,
+            currentprice: pool.currentprice,
+            feePercent: pool.feePercent,
+        }
+    })
+}

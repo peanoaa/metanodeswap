@@ -3,8 +3,8 @@ import { Column } from "../components/table"
 //定义pool页面表头
 export const poolcolumns: Column[] = [
     { key: 'token', title: 'Token' },
-    { key: 'free', title: 'Fee Tier' },
-    { key: 'range', title: 'Price Range' },
+    { key: 'feePercent', title: 'Fee Tier' },
+    { key: 'pricerange', title: 'Price Range' },
     { key: 'currentprice', title: 'Current Price' },
     { key: 'liquidity', title: 'Liquidity' },
 ];
@@ -97,8 +97,8 @@ export const PoolMockData = [
 
 export const poscolumns: Column[] = [
     { key: 'token', title: 'Token' },
-    { key: 'free', title: 'Fee Tier' },
-    { key: 'range', title: 'Price Range' },
+    { key: 'feePercent', title: 'Fee Tier' },
+    { key: 'pricerange', title: 'Price Range' },
     { key: 'currentprice', title: 'Current Price' },
     { key: 'actions', title: 'Actions' },
 ];
