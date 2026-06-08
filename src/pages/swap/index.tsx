@@ -12,8 +12,9 @@ import {
     useReadContracts,
     useWriteContract,
     useWaitForTransactionReceipt,
+    type Config,
 } from 'wagmi'
-import { simulateContract } from 'wagmi/actions'
+import { readContract, simulateContract } from 'wagmi/actions'
 import { normalizePools, type PoolRawData } from '../../utils/coomputer'
 import { erc20Abi, formatUnits, type Address, parseUnits } from 'viem'
 
@@ -37,20 +38,64 @@ type RouteCandidate = {
 type TxStep = 'idle' | 'approve' | 'swap'
 type QuoteMode = 'exactInput' | 'exactOutput'
 
-function tokenSymbol(addr: string, tokenOptions: TokenOption[]): string {
-    return (
-        tokenOptions.find((o) => o.value.toLowerCase() === addr.toLowerCase())?.label
-        ?? `${addr.slice(0, 6)}...${addr.slice(-4)}`
-    )
+function liquidityForToken(addr: string, pools: PoolRawData[]): bigint {
+    const lower = addr.toLowerCase()
+    let total = 0n
+    for (const p of pools) {
+        if (p.token0.toLowerCase() === lower || p.token1.toLowerCase() === lower) {
+            total += p.liquidity
+        }
+    }
+    return total
 }
 
-function getPoolPriceInfo(pool: PoolRawData) {
-    const feePercent = (pool.fee / 10000).toFixed(2) + '%'
-    const tickLowerPrice = (1.0001 ** pool.tickLower).toFixed(2)
-    const tickUpperPrice = (1.0001 ** pool.tickUpper).toFixed(2)
-    const Q96 = 2 ** 96
-    const currentPrice = ((Number(pool.sqrtPriceX96) / Q96) ** 2).toFixed(2)
-    return { feePercent, tickLowerPrice, tickUpperPrice, currentPrice }
+function canonicalAddr(addr: string, addressToCanonical: Map<string, Address>): Address {
+    return addressToCanonical.get(addr.toLowerCase()) ?? (addr as Address)
+}
+
+function buildCanonicalPairList(
+    pairList: Pair[],
+    addressToCanonical: Map<string, Address>
+): Pair[] {
+    const seen = new Set<string>()
+    const pairs: Pair[] = []
+    for (const p of pairList) {
+        const token0 = canonicalAddr(p.token0, addressToCanonical)
+        const token1 = canonicalAddr(p.token1, addressToCanonical)
+        if (token0.toLowerCase() === token1.toLowerCase()) continue
+        const key = [token0.toLowerCase(), token1.toLowerCase()].sort().join('-')
+        if (seen.has(key)) continue
+        seen.add(key)
+        pairs.push({ token0, token1 })
+    }
+    return pairs
+}
+
+function poolTokenForCanonical(
+    canonical: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): Address {
+    const target = canonical.toLowerCase()
+    if (canonicalAddr(pool.token0, addressToCanonical).toLowerCase() === target) {
+        return pool.token0
+    }
+    if (canonicalAddr(pool.token1, addressToCanonical).toLowerCase() === target) {
+        return pool.token1
+    }
+    return canonical as Address
+}
+
+function routerTokensForRoute(
+    route: RouteCandidate,
+    canonicalIn: Address,
+    canonicalOut: Address,
+    addressToCanonical: Map<string, Address>
+) {
+    const tokenIn = poolTokenForCanonical(canonicalIn, route.pools[0], addressToCanonical)
+    const lastPool = route.pools[route.pools.length - 1]
+    const tokenOut = poolTokenForCanonical(canonicalOut, lastPool, addressToCanonical)
+    return { tokenIn, tokenOut }
 }
 
 function buildAdjacency(pairList: Pair[]): Map<string, Set<string>> {
@@ -92,23 +137,39 @@ function findTokenPaths(tokenIn: string, tokenOut: string, pairList: Pair[], max
     return paths
 }
 
-function getPoolsForTokens(tokenA: string, tokenB: string, allPools: PoolRawData[]): PoolRawData[] {
+function getPoolsForTokens(
+    tokenA: string,
+    tokenB: string,
+    allPools: PoolRawData[],
+    addressToCanonical: Map<string, Address>
+): PoolRawData[] {
     const al = tokenA.toLowerCase()
     const bl = tokenB.toLowerCase()
+    const match = (poolAddr: string, target: string) =>
+        canonicalAddr(poolAddr, addressToCanonical).toLowerCase() === target
     return allPools.filter(
         (p) =>
-            (p.token0.toLowerCase() === al && p.token1.toLowerCase() === bl) ||
-            (p.token1.toLowerCase() === al && p.token0.toLowerCase() === bl)
+            (match(p.token0, al) && match(p.token1, bl)) ||
+            (match(p.token1, al) && match(p.token0, bl))
     )
 }
 
 /** 每条 token 路径展开为所有 indexPath 组合 */
-function enumerateRouteCandidates(tokenPath: string[], allPools: PoolRawData[]): RouteCandidate[] {
+function enumerateRouteCandidates(
+    tokenPath: string[],
+    allPools: PoolRawData[],
+    addressToCanonical: Map<string, Address>
+): RouteCandidate[] {
     if (tokenPath.length < 2) return []
 
     const edges: PoolRawData[][] = []
     for (let i = 0; i < tokenPath.length - 1; i++) {
-        const pools = getPoolsForTokens(tokenPath[i], tokenPath[i + 1], allPools)
+        const pools = getPoolsForTokens(
+            tokenPath[i],
+            tokenPath[i + 1],
+            allPools,
+            addressToCanonical
+        )
         if (!pools.length) return []
         edges.push(pools)
     }
@@ -131,24 +192,254 @@ function enumerateRouteCandidates(tokenPath: string[], allPools: PoolRawData[]):
     return results
 }
 
-function pickHeuristicBestRoute(candidates: RouteCandidate[]): RouteCandidate | undefined {
-    if (!candidates.length) return undefined
-    return [...candidates].sort((a, b) => {
-        if (a.tokenPath.length !== b.tokenPath.length) {
-            return a.tokenPath.length - b.tokenPath.length
-        }
-        const minLiquidity = (r: RouteCandidate) =>
-            Math.min(...r.pools.map((p) => Number(p.liquidity)))
-        return minLiquidity(b) - minLiquidity(a)
-    })[0]
+/** 单次报价最多模拟的路径数，避免候选爆炸导致 RPC 过多 */
+const MAX_QUOTE_CANDIDATES = 8
+
+const MIN_SQRT_RATIO = 4295128739n
+const MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342n
+
+function isZeroForOne(
+    canonicalIn: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): boolean {
+    const actualIn = poolTokenForCanonical(canonicalIn, pool, addressToCanonical)
+    return pool.token0.toLowerCase() === actualIn.toLowerCase()
 }
 
-function formatRouteLabel(route: RouteCandidate, tokenOptions: TokenOption[]): string {
-    const symbols = route.tokenPath.map((addr) => tokenSymbol(addr, tokenOptions))
-    const hop = route.tokenPath.length - 1
-    const hopText = hop === 1 ? '直连' : `${hop} 跳`
-    const indexes = route.indexPath.map((i) => `index=${i}`).join(' → ')
-    return `${symbols.join(' → ')}（${hopText}，${indexes}）`
+/** V3 池子 swap 需传入合法价格限制，0 会导致合约 revert */
+function getSqrtPriceLimitX96(
+    canonicalIn: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): bigint {
+    return isZeroForOne(canonicalIn, pool, addressToCanonical)
+        ? MIN_SQRT_RATIO + 1n
+        : MAX_SQRT_RATIO - 1n
+}
+
+function getSwapBlockReason(
+    canonicalIn: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): string | null {
+    if (pool.liquidity === 0n) return '池子流动性为 0'
+    const zeroForOne = isZeroForOne(canonicalIn, pool, addressToCanonical)
+    if (zeroForOne && pool.tick <= pool.tickLower) {
+        return '当前价格已在区间下限，继续卖出该 token 无法成交'
+    }
+    if (!zeroForOne && pool.tick >= pool.tickUpper) {
+        return '当前价格已在区间上限，继续买入该 token 无法成交'
+    }
+    return null
+}
+
+function getRouteSwapBlockReason(
+    route: RouteCandidate,
+    addressToCanonical: Map<string, Address>
+): string | null {
+    for (let i = 0; i < route.pools.length; i++) {
+        const reason = getSwapBlockReason(
+            route.tokenPath[i],
+            route.pools[i],
+            addressToCanonical
+        )
+        if (reason) return reason
+    }
+    return null
+}
+
+function isRouteFullyInRange(route: RouteCandidate): boolean {
+    return route.pools.every(
+        (p) => p.tick > p.tickLower && p.tick < p.tickUpper
+    )
+}
+
+function filterSwappableRoutes(
+    routes: RouteCandidate[],
+    addressToCanonical: Map<string, Address>
+): RouteCandidate[] {
+    return routes.filter(
+        (route) =>
+            !getRouteSwapBlockReason(route, addressToCanonical) &&
+            isRouteFullyInRange(route)
+    )
+}
+
+function extractErrorMessage(error: unknown): string {
+    if (error && typeof error === 'object') {
+        const e = error as { shortMessage?: string; message?: string }
+        return e.shortMessage ?? e.message ?? '未知错误'
+    }
+    return String(error)
+}
+
+function minRouteLiquidity(route: RouteCandidate): number {
+    return Math.min(...route.pools.map((p) => Number(p.liquidity)))
+}
+
+function inRangePoolCount(route: RouteCandidate): number {
+    return route.pools.filter(
+        (p) => p.tick > p.tickLower && p.tick < p.tickUpper
+    ).length
+}
+
+/** 过滤边界池产生的 0 报价或极端价格比（如 100 换出需 1e21 输入） */
+function isReasonableQuoteRatio(amountIn: bigint, amountOut: bigint): boolean {
+    if (amountIn <= 0n || amountOut <= 0n) return false
+    const maxRatio = 1_000_000n
+    if (amountIn * maxRatio < amountOut) return false
+    if (amountIn > amountOut * maxRatio) return false
+    return true
+}
+
+const LIQUIDITY_TIER_FRACTION = 0.1
+
+function pickBestExactInputQuote(
+    results: { route: RouteCandidate; out: bigint }[],
+    amountIn: bigint
+): { route: RouteCandidate; out: bigint } | undefined {
+    const valid = results.filter((r) => isReasonableQuoteRatio(amountIn, r.out))
+    if (!valid.length) return undefined
+    const maxLiq = Math.max(...valid.map((r) => minRouteLiquidity(r.route)))
+    const liqFloor = maxLiq * LIQUIDITY_TIER_FRACTION
+    const tier = valid.filter((r) => minRouteLiquidity(r.route) >= liqFloor)
+    return tier.reduce<{ route: RouteCandidate; out: bigint } | undefined>(
+        (best, cur) => (!best || cur.out > best.out ? cur : best),
+        undefined
+    )
+}
+
+function pickBestExactOutputQuote(
+    results: { route: RouteCandidate; amountInNeeded: bigint }[],
+    amountOut: bigint
+): { route: RouteCandidate; amountInNeeded: bigint } | undefined {
+    const valid = results.filter((r) =>
+        isReasonableQuoteRatio(r.amountInNeeded, amountOut)
+    )
+    if (!valid.length) return undefined
+    const maxLiq = Math.max(...valid.map((r) => minRouteLiquidity(r.route)))
+    const liqFloor = maxLiq * LIQUIDITY_TIER_FRACTION
+    const tier = valid.filter((r) => minRouteLiquidity(r.route) >= liqFloor)
+    return tier.reduce<{ route: RouteCandidate; amountInNeeded: bigint } | undefined>(
+        (best, cur) =>
+            !best || cur.amountInNeeded < best.amountInNeeded ? cur : best,
+        undefined
+    )
+}
+
+function compareRoutePriority(a: RouteCandidate, b: RouteCandidate): number {
+    const inRangeDiff = inRangePoolCount(b) - inRangePoolCount(a)
+    if (inRangeDiff !== 0) return inRangeDiff
+    if (a.tokenPath.length !== b.tokenPath.length) {
+        return a.tokenPath.length - b.tokenPath.length
+    }
+    return minRouteLiquidity(b) - minRouteLiquidity(a)
+}
+
+function pickHeuristicBestRoute(candidates: RouteCandidate[]): RouteCandidate | undefined {
+    if (!candidates.length) return undefined
+    return [...candidates].sort(compareRoutePriority)[0]
+}
+
+/** 报价前裁剪候选路径：优先短路径 + 高流动性，减少 RPC 次数 */
+function pruneRouteCandidatesForQuote(
+    candidates: RouteCandidate[],
+    preferred?: RouteCandidate
+): RouteCandidate[] {
+    const sorted = [...candidates].sort(compareRoutePriority)
+    const pruned =
+        sorted.length <= MAX_QUOTE_CANDIDATES
+            ? sorted
+            : sorted.slice(0, MAX_QUOTE_CANDIDATES)
+    if (preferred && !pruned.some((r) => r.indexPath.join(',') === preferred.indexPath.join(','))) {
+        return [preferred, ...pruned.slice(0, MAX_QUOTE_CANDIDATES - 1)]
+    }
+    return pruned
+}
+
+async function quoteExactInputAmount(
+    config: Config,
+    route: RouteCandidate,
+    canonicalIn: Address,
+    canonicalOut: Address,
+    amountIn: bigint,
+    addressToCanonical: Map<string, Address>,
+    account?: Address
+): Promise<bigint> {
+    const { tokenIn, tokenOut } = routerTokensForRoute(
+        route,
+        canonicalIn,
+        canonicalOut,
+        addressToCanonical
+    )
+    const sqrtPriceLimitX96 = getSqrtPriceLimitX96(canonicalIn, route.pools[0], addressToCanonical)
+    const params = {
+        tokenIn,
+        tokenOut,
+        indexPath: route.indexPath,
+        amountIn,
+        sqrtPriceLimitX96,
+    }
+    try {
+        const { result } = await simulateContract(config, {
+            address: SwapRouterAddress,
+            abi: SwapRouterAbi,
+            functionName: 'quoteExactInput',
+            args: [params],
+            account,
+        })
+        return result as bigint
+    } catch {
+        return readContract(config, {
+            address: SwapRouterAddress,
+            abi: SwapRouterAbi,
+            functionName: 'quoteExactInput',
+            args: [params],
+        }) as Promise<bigint>
+    }
+}
+
+async function quoteExactOutputAmount(
+    config: Config,
+    route: RouteCandidate,
+    canonicalIn: Address,
+    canonicalOut: Address,
+    amountOut: bigint,
+    addressToCanonical: Map<string, Address>,
+    account?: Address
+): Promise<bigint> {
+    const { tokenIn, tokenOut } = routerTokensForRoute(
+        route,
+        canonicalIn,
+        canonicalOut,
+        addressToCanonical
+    )
+    const sqrtPriceLimitX96 = getSqrtPriceLimitX96(canonicalIn, route.pools[0], addressToCanonical)
+    const params = {
+        tokenIn,
+        tokenOut,
+        indexPath: route.indexPath,
+        amountOut,
+        sqrtPriceLimitX96,
+    }
+    try {
+        const { result } = await simulateContract(config, {
+            address: SwapRouterAddress,
+            abi: SwapRouterAbi,
+            functionName: 'quoteExactOutput',
+            args: [params],
+            account,
+        })
+        return result as bigint
+    } catch {
+        return readContract(config, {
+            address: SwapRouterAddress,
+            abi: SwapRouterAbi,
+            functionName: 'quoteExactOutput',
+            args: [params],
+        }) as Promise<bigint>
+    }
 }
 
 export default function Swap() {
@@ -166,6 +457,7 @@ export default function Swap() {
     const pendingAmountInRef = useRef<bigint | null>(null)
     const pendingIndexPathRef = useRef<number[] | null>(null)
     const pendingQuoteModeRef = useRef<QuoteMode | null>(null)
+    const pendingRouteRef = useRef<RouteCandidate | null>(null)
     const skipBlurQuoteRef = useRef(false)
 
     const config = useConfig()
@@ -190,12 +482,15 @@ export default function Swap() {
 
     const tokenAddresses = useMemo(() => {
         if (!pairList.length) return [] as Address[]
-        const set = new Set<string>()
+        // 地址仅大小写不同时应视为同一 token，否则下拉会出现重复 symbol
+        const byLower = new Map<string, Address>()
         pairList.forEach((p) => {
-            set.add(p.token0)
-            set.add(p.token1)
+            const t0 = p.token0.toLowerCase()
+            const t1 = p.token1.toLowerCase()
+            if (!byLower.has(t0)) byLower.set(t0, p.token0)
+            if (!byLower.has(t1)) byLower.set(t1, p.token1)
         })
-        return Array.from(set).map((a) => a as Address)
+        return Array.from(byLower.values())
     }, [pairList])
 
     const { data: symbolResults } = useReadContracts({
@@ -207,39 +502,115 @@ export default function Swap() {
         query: { enabled: tokenAddresses.length > 0 },
     })
 
-    const tokenOptions = useMemo<TokenOption[]>(() => {
-        return tokenAddresses.map((addr, i) => {
-            const symbol =
+    const { tokenOptions, addressToCanonical, symbolToAddresses } = useMemo(() => {
+        const entries = tokenAddresses.map((addr, i) => ({
+            addr,
+            symbol:
                 symbolResults?.[i]?.status === 'success'
                     ? (symbolResults[i].result as string)
-                    : `${addr.slice(0, 6)}...${addr.slice(-4)}`
-            return { label: symbol, value: addr }
-        })
-    }, [tokenAddresses, symbolResults])
+                    : `${addr.slice(0, 6)}...${addr.slice(-4)}`,
+        }))
+        const bySymbol = new Map<string, typeof entries>()
+        for (const entry of entries) {
+            const key = entry.symbol.toUpperCase()
+            const group = bySymbol.get(key) ?? []
+            group.push(entry)
+            bySymbol.set(key, group)
+        }
+
+        const canonicalMap = new Map<string, Address>()
+        const addressesBySymbol = new Map<string, Address[]>()
+        const options: TokenOption[] = []
+        for (const group of bySymbol.values()) {
+            const canonical = group.reduce(
+                (best, entry) =>
+                    liquidityForToken(entry.addr, allPools) >
+                    liquidityForToken(best.addr, allPools)
+                        ? entry
+                        : best,
+                group[0]
+            ).addr
+            options.push({ label: group[0].symbol, value: canonical })
+            addressesBySymbol.set(
+                group[0].symbol.toUpperCase(),
+                group.map((entry) => entry.addr)
+            )
+            for (const entry of group) {
+                canonicalMap.set(entry.addr.toLowerCase(), canonical)
+            }
+        }
+        options.sort((a, b) => a.label.localeCompare(b.label))
+        return {
+            tokenOptions: options,
+            addressToCanonical: canonicalMap,
+            symbolToAddresses: addressesBySymbol,
+        }
+    }, [tokenAddresses, symbolResults, allPools])
+
+    const canonicalPairList = useMemo(
+        () => buildCanonicalPairList(pairList, addressToCanonical),
+        [pairList, addressToCanonical]
+    )
 
     const tokenInOptions = tokenOptions
 
     const tokenOutOptions = useMemo(() => {
-        if (!selectedTokenIn || !pairList.length) return [] as TokenOption[]
+        if (!selectedTokenIn || !canonicalPairList.length) return [] as TokenOption[]
+        const inLower = selectedTokenIn.toLowerCase()
         const addrs = new Set<string>()
-        pairList.forEach((p) => {
-            if (p.token0.toLowerCase() === selectedTokenIn.toLowerCase()) addrs.add(p.token1)
-            if (p.token1.toLowerCase() === selectedTokenIn.toLowerCase()) addrs.add(p.token0)
+        canonicalPairList.forEach((p) => {
+            if (p.token0.toLowerCase() === inLower) addrs.add(p.token1.toLowerCase())
+            if (p.token1.toLowerCase() === inLower) addrs.add(p.token0.toLowerCase())
         })
-        return Array.from(addrs).map((addr) => {
-            const opt = tokenOptions.find((o) => o.value.toLowerCase() === addr.toLowerCase())
-            return opt ?? { label: addr, value: addr as Address }
-        })
-    }, [selectedTokenIn, pairList, tokenOptions])
+        return Array.from(addrs)
+            .map((addr) => tokenOptions.find((o) => o.value.toLowerCase() === addr))
+            .filter((opt): opt is TokenOption => !!opt)
+    }, [selectedTokenIn, canonicalPairList, tokenOptions])
 
     const routeCandidates = useMemo(() => {
         if (!selectedTokenIn || !selectedTokenOut) return [] as RouteCandidate[]
-        const tokenPaths = findTokenPaths(selectedTokenIn, selectedTokenOut, pairList)
-        return tokenPaths.flatMap((path) => enumerateRouteCandidates(path, allPools))
-    }, [selectedTokenIn, selectedTokenOut, pairList, allPools])
+        const tokenPaths = findTokenPaths(
+            selectedTokenIn,
+            selectedTokenOut,
+            canonicalPairList
+        )
+        return tokenPaths.flatMap((path) =>
+            enumerateRouteCandidates(path, allPools, addressToCanonical)
+        )
+    }, [selectedTokenIn, selectedTokenOut, canonicalPairList, allPools, addressToCanonical])
 
     const tokenInAddress = selectedTokenIn as Address
     const tokenOutAddress = selectedTokenOut as Address
+
+    const payTokenAddresses = useMemo(() => {
+        if (!selectedTokenIn) return [] as Address[]
+        const opt = tokenOptions.find(
+            (o) => o.value.toLowerCase() === selectedTokenIn.toLowerCase()
+        )
+        if (!opt) return [tokenInAddress]
+        return symbolToAddresses.get(opt.label.toUpperCase()) ?? [tokenInAddress]
+    }, [selectedTokenIn, tokenOptions, symbolToAddresses, tokenInAddress])
+
+    const approveTokenAddress = useMemo(() => {
+        if (!bestRoute || !selectedTokenIn) return tokenInAddress
+        return poolTokenForCanonical(
+            selectedTokenIn,
+            bestRoute.pools[0],
+            addressToCanonical
+        )
+    }, [bestRoute, selectedTokenIn, tokenInAddress, addressToCanonical])
+
+    const { data: balanceResults } = useReadContracts({
+        contracts: payTokenAddresses.map((addr) => ({
+            address: addr,
+            abi: erc20Abi,
+            functionName: 'balanceOf' as const,
+            args: [address!],
+        })),
+        query: {
+            enabled: !!address && payTokenAddresses.length > 0,
+        },
+    })
 
     const { data: tokenMetaResults, refetch: refetchAllowance } = useReadContracts({
         contracts:
@@ -256,13 +627,7 @@ export default function Swap() {
                         functionName: 'decimals' as const,
                     },
                     {
-                        address: tokenInAddress,
-                        abi: erc20Abi,
-                        functionName: 'balanceOf' as const,
-                        args: [address],
-                    },
-                    {
-                        address: tokenInAddress,
+                        address: approveTokenAddress,
                         abi: erc20Abi,
                         functionName: 'allowance' as const,
                         args: [address, SwapRouterAddress],
@@ -276,22 +641,21 @@ export default function Swap() {
 
     const decimalsIn = Number(tokenMetaResults?.[0]?.result ?? 18)
     const decimalsOut = Number(tokenMetaResults?.[1]?.result ?? 18)
-    const balanceIn = tokenMetaResults?.[2]?.status === 'success'
-        ? (tokenMetaResults[2].result as bigint)
-        : 0n
+    const balanceIn = useMemo(() => {
+        if (!balanceResults?.length) return 0n
+        return balanceResults.reduce((total, res) => {
+            if (res.status === 'success') {
+                return total + (res.result as bigint)
+            }
+            return total
+        }, 0n)
+    }, [balanceResults])
     const routerConfigured =
         SwapRouterAddress !== '0x0000000000000000000000000000000000000000'
 
     const heuristicRoute = useMemo(
         () => pickHeuristicBestRoute(routeCandidates),
         [routeCandidates]
-    )
-
-    const displayRoute = bestRoute ?? heuristicRoute
-
-    const routeLabel = useMemo(
-        () => (displayRoute ? formatRouteLabel(displayRoute, tokenOptions) : ''),
-        [displayRoute, tokenOptions]
     )
 
     const resetQuoteState = useCallback(() => {
@@ -324,42 +688,56 @@ export default function Swap() {
             return
         }
 
+        const swappableRoutes = filterSwappableRoutes(routeCandidates, addressToCanonical)
+        if (!swappableRoutes.length) {
+            const blockReason =
+                heuristicRoute
+                    ? getRouteSwapBlockReason(heuristicRoute, addressToCanonical)
+                    : null
+            setQuoteError(
+                blockReason ?? '该兑换方向在池子价格区间外，请反向兑换或等待价格回到区间内'
+            )
+            return
+        }
+
         setIsQuoting(true)
         setQuoteError('')
         try {
-            let bestIdx = -1
-            let bestOut = 0n
-            for (let i = 0; i < routeCandidates.length; i++) {
-                const route = routeCandidates[i]
-                try {
-                    const { result } = await simulateContract(config, {
-                        address: SwapRouterAddress,
-                        abi: SwapRouterAbi,
-                        functionName: 'quoteExactInput',
-                        args: [
-                            {
-                                tokenIn: tokenInAddress,
-                                tokenOut: tokenOutAddress,
-                                indexPath: route.indexPath,
-                                amountIn: amountInParsed,
-                                sqrtPriceLimitX96: 0n,
-                            },
-                        ],
-                    })
-                    const out = result as bigint
-                    if (out > bestOut) {
-                        bestOut = out
-                        bestIdx = i
-                    }
-                } catch {
-                    // 跳过不可用路径
+            const candidatesToQuote = pruneRouteCandidatesForQuote(
+                swappableRoutes,
+                heuristicRoute
+            )
+            const quoteResults = await Promise.allSettled(
+                candidatesToQuote.map(async (route) => {
+                    const out = await quoteExactInputAmount(
+                        config,
+                        route,
+                        tokenInAddress,
+                        tokenOutAddress,
+                        amountInParsed,
+                        addressToCanonical,
+                        address
+                    )
+                    return { route, out }
+                })
+            )
+
+            const fulfilled: { route: RouteCandidate; out: bigint }[] = []
+            let lastError = ''
+            for (const res of quoteResults) {
+                if (res.status === 'rejected') {
+                    lastError = extractErrorMessage(res.reason)
+                    continue
                 }
+                fulfilled.push(res.value)
             }
-            if (bestIdx < 0) {
-                setQuoteError('报价失败，请检查数量或流动性')
+            const best = pickBestExactInputQuote(fulfilled, amountInParsed)
+            if (!best || best.out <= 0n) {
+                setQuoteError(lastError || '报价失败，请检查数量或流动性')
                 return
             }
-            setBestRoute(routeCandidates[bestIdx])
+            const { route: bestRouteResult, out: bestOut } = best
+            setBestRoute(bestRouteResult)
             setBestQuoteOut(bestOut)
             setBestQuoteIn(undefined)
             setQuoteMode('exactInput')
@@ -374,11 +752,14 @@ export default function Swap() {
         selectedTokenOut,
         amountIn,
         routeCandidates,
+        heuristicRoute,
         decimalsIn,
         decimalsOut,
         config,
+        address,
         tokenInAddress,
         tokenOutAddress,
+        addressToCanonical,
     ])
 
     const quoteOnAmountOutBlur = useCallback(async () => {
@@ -403,42 +784,56 @@ export default function Swap() {
             return
         }
 
+        const swappableRoutes = filterSwappableRoutes(routeCandidates, addressToCanonical)
+        if (!swappableRoutes.length) {
+            const blockReason =
+                heuristicRoute
+                    ? getRouteSwapBlockReason(heuristicRoute, addressToCanonical)
+                    : null
+            setQuoteError(
+                blockReason ?? '该兑换方向在池子价格区间外，请反向兑换或等待价格回到区间内'
+            )
+            return
+        }
+
         setIsQuoting(true)
         setQuoteError('')
         try {
-            let bestIdx = -1
-            let bestIn: bigint | undefined
-            for (let i = 0; i < routeCandidates.length; i++) {
-                const route = routeCandidates[i]
-                try {
-                    const { result } = await simulateContract(config, {
-                        address: SwapRouterAddress,
-                        abi: SwapRouterAbi,
-                        functionName: 'quoteExactOutput',
-                        args: [
-                            {
-                                tokenIn: tokenInAddress,
-                                tokenOut: tokenOutAddress,
-                                indexPath: route.indexPath,
-                                amountOut: amountOutParsed,
-                                sqrtPriceLimitX96: 0n,
-                            },
-                        ],
-                    })
-                    const amountInNeeded = result as bigint
-                    if (bestIn === undefined || amountInNeeded < bestIn) {
-                        bestIn = amountInNeeded
-                        bestIdx = i
-                    }
-                } catch {
-                    // 跳过不可用路径
+            const candidatesToQuote = pruneRouteCandidatesForQuote(
+                swappableRoutes,
+                heuristicRoute
+            )
+            const quoteResults = await Promise.allSettled(
+                candidatesToQuote.map(async (route) => {
+                    const amountInNeeded = await quoteExactOutputAmount(
+                        config,
+                        route,
+                        tokenInAddress,
+                        tokenOutAddress,
+                        amountOutParsed,
+                        addressToCanonical,
+                        address
+                    )
+                    return { route, amountInNeeded }
+                })
+            )
+
+            const fulfilled: { route: RouteCandidate; amountInNeeded: bigint }[] = []
+            let lastError = ''
+            for (const res of quoteResults) {
+                if (res.status === 'rejected') {
+                    lastError = extractErrorMessage(res.reason)
+                    continue
                 }
+                fulfilled.push(res.value)
             }
-            if (bestIdx < 0 || bestIn === undefined) {
-                setQuoteError('报价失败，请检查数量或流动性')
+            const best = pickBestExactOutputQuote(fulfilled, amountOutParsed)
+            if (!best || best.amountInNeeded <= 0n) {
+                setQuoteError(lastError || '报价失败，请检查数量或流动性')
                 return
             }
-            setBestRoute(routeCandidates[bestIdx])
+            const { route: bestRouteResult, amountInNeeded: bestIn } = best
+            setBestRoute(bestRouteResult)
             setBestQuoteIn(bestIn)
             setBestQuoteOut(undefined)
             setQuoteMode('exactOutput')
@@ -453,17 +848,17 @@ export default function Swap() {
         selectedTokenOut,
         amountOut,
         routeCandidates,
+        heuristicRoute,
         decimalsIn,
         decimalsOut,
         config,
+        address,
         tokenInAddress,
         tokenOutAddress,
+        addressToCanonical,
     ])
 
-    const selectedPoolPriceInfo = useMemo(() => {
-        if (!displayRoute || displayRoute.pools.length !== 1) return null
-        return getPoolPriceInfo(displayRoute.pools[0])
-    }, [displayRoute])
+    const allowanceResultIndex = 2
 
     const balanceInDisplay = useMemo(() => {
         try {
@@ -479,21 +874,27 @@ export default function Swap() {
     const isSubmitting = isPending || isConfirming
 
     const approveTokenIn = useCallback(
-        (approveAmount: bigint) => {
-            if (!selectedTokenIn) return
+        (spenderToken: Address, approveAmount: bigint) => {
             writeContract({
-                address: tokenInAddress,
+                address: spenderToken,
                 abi: erc20Abi,
                 functionName: 'approve',
                 args: [SwapRouterAddress, approveAmount],
             })
             setTxStep('approve')
         },
-        [selectedTokenIn, tokenInAddress, writeContract]
+        [writeContract]
     )
 
     const executeExactInput = useCallback(
-        (amountInDesired: bigint, amountOutMinimum: bigint, indexPath: number[]) => {
+        (
+            routerTokenIn: Address,
+            routerTokenOut: Address,
+            amountInDesired: bigint,
+            amountOutMinimum: bigint,
+            indexPath: number[],
+            sqrtPriceLimitX96: bigint
+        ) => {
             if (!address) return
             writeContract({
                 address: SwapRouterAddress,
@@ -501,24 +902,31 @@ export default function Swap() {
                 functionName: 'exactInput',
                 args: [
                     {
-                        tokenIn: tokenInAddress,
-                        tokenOut: tokenOutAddress,
+                        tokenIn: routerTokenIn,
+                        tokenOut: routerTokenOut,
                         indexPath,
                         recipient: address,
                         deadline: Math.floor(Date.now() / 1000) + 3600,
                         amountIn: amountInDesired,
                         amountOutMinimum,
-                        sqrtPriceLimitX96: 0n,
+                        sqrtPriceLimitX96,
                     },
                 ],
             })
             setTxStep('swap')
         },
-        [address, tokenInAddress, tokenOutAddress, writeContract]
+        [address, writeContract]
     )
 
     const executeExactOutput = useCallback(
-        (amountOutDesired: bigint, amountInMaximum: bigint, indexPath: number[]) => {
+        (
+            routerTokenIn: Address,
+            routerTokenOut: Address,
+            amountOutDesired: bigint,
+            amountInMaximum: bigint,
+            indexPath: number[],
+            sqrtPriceLimitX96: bigint
+        ) => {
             if (!address) return
             writeContract({
                 address: SwapRouterAddress,
@@ -526,51 +934,79 @@ export default function Swap() {
                 functionName: 'exactOutput',
                 args: [
                     {
-                        tokenIn: tokenInAddress,
-                        tokenOut: tokenOutAddress,
+                        tokenIn: routerTokenIn,
+                        tokenOut: routerTokenOut,
                         indexPath,
                         recipient: address,
                         deadline: Math.floor(Date.now() / 1000) + 3600,
                         amountOut: amountOutDesired,
                         amountInMaximum,
-                        sqrtPriceLimitX96: 0n,
+                        sqrtPriceLimitX96,
                     },
                 ],
             })
             setTxStep('swap')
         },
-        [address, tokenInAddress, tokenOutAddress, writeContract]
+        [address, writeContract]
     )
 
     const continueSwapFlow = useCallback(
         async (
             approveAmount: bigint,
             indexPath: number[],
-            mode: QuoteMode
+            mode: QuoteMode,
+            route: RouteCandidate
         ) => {
             pendingAmountInRef.current = approveAmount
             pendingQuoteModeRef.current = mode
+            const { tokenIn: routerTokenIn, tokenOut: routerTokenOut } =
+                routerTokensForRoute(
+                    route,
+                    tokenInAddress,
+                    tokenOutAddress,
+                    addressToCanonical
+                )
             const { data: latestMeta } = await refetchAllowance()
             const latestAllowance =
-                latestMeta?.[3]?.status === 'success'
-                    ? (latestMeta[3].result as bigint)
+                latestMeta?.[allowanceResultIndex]?.status === 'success'
+                    ? (latestMeta[allowanceResultIndex].result as bigint)
                     : 0n
 
             if (latestAllowance < approveAmount) {
-                approveTokenIn(approveAmount)
+                approveTokenIn(routerTokenIn, approveAmount)
                 return
             }
 
+            const sqrtPriceLimitX96 = getSqrtPriceLimitX96(
+                selectedTokenIn,
+                route.pools[0],
+                addressToCanonical
+            )
+
             if (mode === 'exactOutput') {
                 const amountOutDesired = parseUnits(amountOut, decimalsOut)
-                executeExactOutput(amountOutDesired, approveAmount, indexPath)
+                executeExactOutput(
+                    routerTokenIn,
+                    routerTokenOut,
+                    amountOutDesired,
+                    approveAmount,
+                    indexPath,
+                    sqrtPriceLimitX96
+                )
                 return
             }
 
             const amountInDesired = parseUnits(amountIn, decimalsIn)
             const amountOutMinimum =
                 bestQuoteOut && bestQuoteOut > 0n ? (bestQuoteOut * 95n) / 100n : 0n
-            executeExactInput(amountInDesired, amountOutMinimum, indexPath)
+            executeExactInput(
+                routerTokenIn,
+                routerTokenOut,
+                amountInDesired,
+                amountOutMinimum,
+                indexPath,
+                sqrtPriceLimitX96
+            )
         },
         [
             refetchAllowance,
@@ -582,6 +1018,11 @@ export default function Swap() {
             amountOut,
             decimalsIn,
             decimalsOut,
+            selectedTokenIn,
+            tokenInAddress,
+            tokenOutAddress,
+            addressToCanonical,
+            allowanceResultIndex,
         ]
     )
 
@@ -620,7 +1061,8 @@ export default function Swap() {
                 if (amountInDesired <= 0n) throw new Error('数量不能为 0')
                 if (amountInDesired > balanceIn) throw new Error('余额不足')
                 pendingIndexPathRef.current = route.indexPath
-                continueSwapFlow(amountInDesired, route.indexPath, 'exactInput')
+                pendingRouteRef.current = route
+                continueSwapFlow(amountInDesired, route.indexPath, 'exactInput', route)
             } else {
                 if (!amountOut.trim()) throw new Error('请填写 token1 数量')
                 const amountOutDesired = parseUnits(amountOut, decimalsOut)
@@ -629,7 +1071,8 @@ export default function Swap() {
                 const amountInMaximum = (bestQuoteIn * 105n) / 100n
                 if (amountInMaximum > balanceIn) throw new Error('余额不足')
                 pendingIndexPathRef.current = route.indexPath
-                continueSwapFlow(amountInMaximum, route.indexPath, 'exactOutput')
+                pendingRouteRef.current = route
+                continueSwapFlow(amountInMaximum, route.indexPath, 'exactOutput', route)
             }
         } catch (e) {
             alert(e instanceof Error ? e.message : '参数错误')
@@ -645,10 +1088,11 @@ export default function Swap() {
         const pending = pendingAmountInRef.current
         const indexPath = pendingIndexPathRef.current
         const mode = pendingQuoteModeRef.current
-        if (!pending || !indexPath || !mode) return
+        const route = pendingRouteRef.current
+        if (!pending || !indexPath || !mode || !route) return
 
         if (txStep === 'approve') {
-            continueSwapFlow(pending, indexPath, mode)
+            continueSwapFlow(pending, indexPath, mode, route)
         } else if (txStep === 'swap') {
             setTxStep('idle')
             setAmountIn('')
@@ -656,18 +1100,11 @@ export default function Swap() {
             resetQuoteState()
             pendingAmountInRef.current = null
             pendingQuoteModeRef.current = null
+            pendingRouteRef.current = null
             refetchAllowance()
             alert('兑换成功')
         }
     }, [isTxSuccess, txStep, continueSwapFlow, refetchAllowance, resetQuoteState])
-
-    const routePlaceholder = !selectedTokenOut
-        ? '请先选择接收 token'
-        : poolsLoading
-            ? '计算路径中...'
-            : routeCandidates.length === 0
-                ? '该币对暂无可用路径，请先去 Pool 页建池'
-                : '自动计算最优路径'
 
     return (
         <div className='border max-w-6xl mx-auto px-6 py-8'>
@@ -704,7 +1141,7 @@ export default function Swap() {
                                 >
                                     <option value=''>请选择支付 token</option>
                                     {tokenInOptions.map((opt) => (
-                                        <option key={opt.value} value={opt.value}>
+                                        <option key={opt.label} value={opt.value}>
                                             {opt.label}
                                         </option>
                                     ))}
@@ -726,57 +1163,12 @@ export default function Swap() {
                                 >
                                     <option value=''>请选择接收 token</option>
                                     {tokenOutOptions.map((opt) => (
-                                        <option key={opt.value} value={opt.value}>
+                                        <option key={opt.label} value={opt.value}>
                                             {opt.label}
                                         </option>
                                     ))}
                                 </select>
                             </div>
-
-                            <div>
-                                <p className='text-sm mb-1'>最优路径：</p>
-                                <input
-                                    type='text'
-                                    disabled
-                                    value={routeLabel}
-                                    placeholder={routePlaceholder}
-                                    className='w-full border rounded-xl px-4 py-3 outline-none bg-gray-100 text-gray-500 cursor-not-allowed'
-                                />
-                            </div>
-
-                            {selectedPoolPriceInfo && (
-                                <>
-                                    <div>
-                                        <p className='text-sm mb-1'>费率：</p>
-                                        <input
-                                            type='text'
-                                            disabled
-                                            value={selectedPoolPriceInfo.feePercent}
-                                            className='w-full border rounded-xl px-4 py-3 outline-none bg-gray-100 text-gray-500 cursor-not-allowed'
-                                        />
-                                    </div>
-
-                                    <div>
-                                        <p className='text-sm mb-1'>价格区间：</p>
-                                        <input
-                                            type='text'
-                                            disabled
-                                            value={`${selectedPoolPriceInfo.tickLowerPrice} ~ ${selectedPoolPriceInfo.tickUpperPrice}`}
-                                            className='w-full border rounded-xl px-4 py-3 outline-none bg-gray-100 text-gray-500 cursor-not-allowed'
-                                        />
-                                    </div>
-
-                                    <div>
-                                        <p className='text-sm mb-1'>当前价格：</p>
-                                        <input
-                                            type='text'
-                                            disabled
-                                            value={selectedPoolPriceInfo.currentPrice}
-                                            className='w-full border rounded-xl px-4 py-3 outline-none bg-gray-100 text-gray-500 cursor-not-allowed'
-                                        />
-                                    </div>
-                                </>
-                            )}
 
                             <div>
                                 <p className='text-sm mb-1'>token0 数量：</p>
