@@ -2,11 +2,47 @@ import { useMemo } from 'react'
 import { useReadContracts } from 'wagmi'
 import { erc20Abi, formatUnits, type Address } from 'viem'
 
+const Q96 = 2 ** 96
 
+/** tick 对应的链上原始价格比 (token1 最小单位 / token0 最小单位) */
+function tickToRawPrice(tick: number): number {
+    return 1.0001 ** tick
+}
+
+/** 根据decimals转换价格 (每 1 个 token0 可换多少 token1) */
+export function rawPriceToHuman(rawPrice: number, decimals0: number, decimals1: number): number {
+    return rawPrice * 10 ** (decimals0 - decimals1)
+}
+
+/** tick 价格 */
+export function tickToHumanPrice(
+    tick: number,
+    decimals0: number,
+    decimals1: number,
+    fixedDigits = 4
+): string {
+    const human = rawPriceToHuman(tickToRawPrice(tick), decimals0, decimals1)
+    if (!Number.isFinite(human)) return '—'
+    return human.toFixed(fixedDigits)
+}
+
+/** sqrtPriceX96 转换 */
+export function sqrtPriceX96ToHumanPrice(
+    sqrtPriceX96: bigint,
+    decimals0: number,
+    decimals1: number,
+    fixedDigits = 2
+): string {
+    const raw = (Number(sqrtPriceX96) / Q96) ** 2
+    const human = rawPriceToHuman(raw, decimals0, decimals1)
+    if (!Number.isFinite(human)) return '—'
+    return human.toFixed(fixedDigits)
+}
 
 export function usePoolTokens(pools: PoolRawData[] | undefined) {
     const contracts = useMemo(() => {
         if (!pools) return [];
+        //读取池子中的token0,token1,decimals,balanceOf
         return pools.flatMap((p) => [
             { address: p.token0, abi: erc20Abi, functionName: 'symbol' },
             { address: p.token1, abi: erc20Abi, functionName: 'symbol' },
@@ -17,6 +53,7 @@ export function usePoolTokens(pools: PoolRawData[] | undefined) {
         ])
     }, [pools])
 
+    //批量读取合约数据
     const { data: results, isLoading, error } = useReadContracts({
         contracts,
         query: {
@@ -26,6 +63,7 @@ export function usePoolTokens(pools: PoolRawData[] | undefined) {
 
     console.log(results, '++++++++++++++++++++');
 
+    //生成表格数据
     const rows = useMemo(() => {
         if (!pools?.length || !results) return []
 
@@ -51,13 +89,10 @@ export function usePoolTokens(pools: PoolRawData[] | undefined) {
 
             const feePercent = (p.fee / 10000).toFixed(2) + '%';
 
-            // p.tickLower = Number((1.0001 ** Number(p.tickLower)).toFixed(4))
-            // p.tickUpper = Number((1.0001 ** Number(p.tickUpper)).toFixed(4))
-            const tickLowerPrice = Number((1.0001 ** Number(p.tickLower)).toFixed(4));
-            const tickUpperPrice = Number((1.0001 ** Number(p.tickUpper)).toFixed(4));
-            const pricerange = tickLowerPrice + '-' + tickUpperPrice;
-            const Q96 = Math.pow(2, 96)
-            const currentprice = ((Number(p.sqrtPriceX96) / Q96) ** 2).toFixed(2)
+            const tickLowerPrice = tickToHumanPrice(p.tickLower, decimals0, decimals1)
+            const tickUpperPrice = tickToHumanPrice(p.tickUpper, decimals0, decimals1)
+            const pricerange = `${tickLowerPrice}-${tickUpperPrice}`
+            const currentprice = sqrtPriceX96ToHumanPrice(p.sqrtPriceX96, decimals0, decimals1)
             return {
                 ...p,
                 token,
@@ -71,7 +106,7 @@ export function usePoolTokens(pools: PoolRawData[] | undefined) {
 
 
     console.log(rows, '-----------------------------------------');
-    //把rows数据存储到poolsData中
+    //把rows数据存储到全局poolsData中
     poolsData = rows;
     return { rows, isLoading }
 

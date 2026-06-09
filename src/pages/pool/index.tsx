@@ -12,10 +12,11 @@ import {
 import { PoolManagerAbi } from '../../abi/PoolManager'
 import { usePoolTokens, normalizePools } from '../../utils/coomputer'
 import { useState, useMemo, useEffect } from 'react'
-import Mask from '../../components/Mask'
+// import Mask from '../../components/Mask'
 
-
+//合约地址
 const PoolManagerAddress = '0xddC12b3F9F7C91C79DA7433D8d212FB78d609f7B'
+
 
 export default function Pool() {
     type PoolForm = {
@@ -35,7 +36,7 @@ export default function Pool() {
         tickUpper: '',
         sqrtPriceX96: '',
     })
-
+    //路由
 
     const router = useRouter();
 
@@ -45,7 +46,7 @@ export default function Pool() {
     //获取钱包链接状态
     const { isConnected } = useAccount()
 
-    //读取合约
+    //读取合约，获取所有交易池
     const { data: poolsRaw, error, isLoading, refetch } = useReadContract({
         abi: PoolManagerAbi,
         address: PoolManagerAddress,
@@ -57,9 +58,10 @@ export default function Pool() {
     // //查看返回值
     console.log('data:', poolsRaw);   // ← 检查返回值
 
-    // 规范化池子数据
+    // 转换池子的数据格式
     const pools = useMemo(() => normalizePools(poolsRaw), [poolsRaw])
 
+    //生成表格数据
     const { rows, isLoading: tken } = usePoolTokens(
         isConnected ? pools : undefined
     )
@@ -67,6 +69,7 @@ export default function Pool() {
     //写合约
     const { writeContract, data: hash, isPending, error: writeError } = useWriteContract()
 
+    //等待交易确认
     const { isLoading: isConfirming, isSuccess, isError: isReceiptError } =
         useWaitForTransactionReceipt({
             hash,
@@ -76,6 +79,7 @@ export default function Pool() {
     //创建池子
     const createPoolIfNecessary = () => {
         try {
+            //表单校验，格式转换
             const params = buildParams(form)
             writeContract({
                 abi: PoolManagerAbi,
@@ -145,7 +149,7 @@ export default function Pool() {
                 tickUpper: '',
                 sqrtPriceX96: '',
             })
-            alert('池子创建成功！') 
+            alert('池子创建成功！')
         }
 
         refresh()

@@ -1,6 +1,7 @@
 /**
  * Swap 页：参考 Position 弹窗样式，完成 token 兑换。
- * 链上流程：选 tokenIn → tokenOut → 自动算最优 indexPath → quote → approve → SwapRouter.exactInput
+ * 链上流程：选 tokenIn → tokenOut → 按现货兑换比例排序可换池 → 输入金额 → quote → approve → swap
+ * indexPath 从高到低排列；合约从前向后逐池兑换，直到 amount 耗尽或全部尝试完毕。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PoolManagerAbi } from '../../abi/PoolManager'
@@ -19,7 +20,7 @@ import { normalizePools, type PoolRawData } from '../../utils/coomputer'
 import { erc20Abi, formatUnits, type Address, parseUnits } from 'viem'
 
 const PoolManagerAddress = '0xddC12b3F9F7C91C79DA7433D8d212FB78d609f7B'
-/** 请替换为链上已部署的 SwapRouter 地址 */
+
 const SwapRouterAddress = '0xD2c220143F5784b3bD84ae12747d97C8A36CeCB2' as Address
 
 type Pair = {
@@ -32,12 +33,16 @@ type TokenOption = {
 }
 type RouteCandidate = {
     tokenPath: string[]
+    /** 传给 SwapRouter 的池子 index 序列，同跳多池时按优先级依次尝试 */
     indexPath: number[]
     pools: PoolRawData[]
+    /** 每一跳在 indexPath 中占用的池子数量，如 [4] 或 [2, 1] */
+    hopPoolCounts: number[]
 }
 type TxStep = 'idle' | 'approve' | 'swap'
 type QuoteMode = 'exactInput' | 'exactOutput'
 
+//获取token流动性，用于排序池子
 function liquidityForToken(addr: string, pools: PoolRawData[]): bigint {
     const lower = addr.toLowerCase()
     let total = 0n
@@ -49,10 +54,12 @@ function liquidityForToken(addr: string, pools: PoolRawData[]): bigint {
     return total
 }
 
+//获取token地址
 function canonicalAddr(addr: string, addressToCanonical: Map<string, Address>): Address {
     return addressToCanonical.get(addr.toLowerCase()) ?? (addr as Address)
 }
 
+//构建交易对列表
 function buildCanonicalPairList(
     pairList: Pair[],
     addressToCanonical: Map<string, Address>
@@ -71,6 +78,7 @@ function buildCanonicalPairList(
     return pairs
 }
 
+//获取池子token地址
 function poolTokenForCanonical(
     canonical: string,
     pool: PoolRawData,
@@ -86,6 +94,7 @@ function poolTokenForCanonical(
     return canonical as Address
 }
 
+//获取交易路径token地址
 function routerTokensForRoute(
     route: RouteCandidate,
     canonicalIn: Address,
@@ -98,45 +107,21 @@ function routerTokensForRoute(
     return { tokenIn, tokenOut }
 }
 
-function buildAdjacency(pairList: Pair[]): Map<string, Set<string>> {
-    const adj = new Map<string, Set<string>>()
-    const addEdge = (a: string, b: string) => {
-        if (!adj.has(a)) adj.set(a, new Set())
-        if (!adj.has(b)) adj.set(b, new Set())
-        adj.get(a)!.add(b)
-        adj.get(b)!.add(a)
-    }
-    pairList.forEach((p) => addEdge(p.token0.toLowerCase(), p.token1.toLowerCase()))
-    return adj
-}
-
-/** BFS 找 tokenIn → tokenOut 的所有路径（最多 2 跳） */
-function findTokenPaths(tokenIn: string, tokenOut: string, pairList: Pair[], maxHops = 2): string[][] {
+/** 仅查找 tokenIn → tokenOut 的直连路径，不支持经中间 token 中转 */
+function findTokenPaths(tokenIn: string, tokenOut: string, pairList: Pair[]): string[][] {
     const start = tokenIn.toLowerCase()
     const end = tokenOut.toLowerCase()
     if (start === end) return []
 
-    const adj = buildAdjacency(pairList)
-    const paths: string[][] = []
-    const queue: { node: string; path: string[] }[] = [{ node: start, path: [start] }]
-
-    while (queue.length > 0) {
-        const { node, path } = queue.shift()!
-        if (path.length > maxHops + 1) continue
-
-        for (const neighbor of adj.get(node) ?? []) {
-            if (path.includes(neighbor)) continue
-            const newPath = [...path, neighbor]
-            if (neighbor === end) {
-                paths.push(newPath)
-            } else if (newPath.length <= maxHops) {
-                queue.push({ node: neighbor, path: newPath })
-            }
-        }
-    }
-    return paths
+    const hasDirect = pairList.some(
+        (p) =>
+            (p.token0.toLowerCase() === start && p.token1.toLowerCase() === end) ||
+            (p.token1.toLowerCase() === start && p.token0.toLowerCase() === end)
+    )
+    return hasDirect ? [[start, end]] : []
 }
 
+//获取池子列表
 function getPoolsForTokens(
     tokenA: string,
     tokenB: string,
@@ -154,46 +139,92 @@ function getPoolsForTokens(
     )
 }
 
-/** 每条 token 路径展开为所有 indexPath 组合 */
+function isPoolSwappable(
+    canonicalIn: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): boolean {
+    if (pool.liquidity === 0n) return false
+    if (pool.tick <= pool.tickLower || pool.tick >= pool.tickUpper) return false
+    return getSwapBlockReason(canonicalIn, pool, addressToCanonical) === null
+}
+
+/** 池子当前现货兑换比例：1 单位 tokenIn 可换多少 tokenOut（基于 tick） */
+function poolSpotExchangeRatio(
+    canonicalIn: string,
+    pool: PoolRawData,
+    addressToCanonical: Map<string, Address>
+): number {
+    const zeroForOne = isZeroForOne(canonicalIn, pool, addressToCanonical)
+    return zeroForOne ? 1.0001 ** pool.tick : 1.0001 ** -pool.tick
+}
+
+/** 过滤不可换池，按现货兑换比例从高到低排序 */
+function sortPoolsForHop(
+    canonicalIn: string,
+    pools: PoolRawData[],
+    addressToCanonical: Map<string, Address>
+): PoolRawData[] {
+    return pools
+        .filter((p) => isPoolSwappable(canonicalIn, p, addressToCanonical))
+        .sort(
+            (a, b) =>
+                poolSpotExchangeRatio(canonicalIn, b, addressToCanonical) -
+                poolSpotExchangeRatio(canonicalIn, a, addressToCanonical)
+        )
+}
+
+/**
+ * 为一条 token 路径构建 indexPath：每一跳的可换池按兑换比例从高到低串入，
+ * 合约从前向后逐池兑换直至 amount 耗尽。
+ */
+function buildRouteWithPoolFallback(
+    tokenPath: string[],
+    allPools: PoolRawData[],
+    addressToCanonical: Map<string, Address>
+): RouteCandidate | null {
+    if (tokenPath.length < 2) return null
+
+    const indexPath: number[] = []
+    const pools: PoolRawData[] = []
+    const hopPoolCounts: number[] = []
+
+    for (let i = 0; i < tokenPath.length - 1; i++) {
+        const edgePools = sortPoolsForHop(
+            tokenPath[i],
+            getPoolsForTokens(
+                tokenPath[i],
+                tokenPath[i + 1],
+                allPools,
+                addressToCanonical
+            ),
+            addressToCanonical
+        )
+        if (!edgePools.length) return null
+
+        hopPoolCounts.push(edgePools.length)
+        for (const pool of edgePools) {
+            indexPath.push(pool.index)
+            pools.push(pool)
+        }
+    }
+
+    return { tokenPath, indexPath, pools, hopPoolCounts }
+}
+
+/** 每条 token 路径生成一条带多池兜底的 RouteCandidate */
 function enumerateRouteCandidates(
     tokenPath: string[],
     allPools: PoolRawData[],
     addressToCanonical: Map<string, Address>
 ): RouteCandidate[] {
-    if (tokenPath.length < 2) return []
-
-    const edges: PoolRawData[][] = []
-    for (let i = 0; i < tokenPath.length - 1; i++) {
-        const pools = getPoolsForTokens(
-            tokenPath[i],
-            tokenPath[i + 1],
-            allPools,
-            addressToCanonical
-        )
-        if (!pools.length) return []
-        edges.push(pools)
-    }
-
-    const results: RouteCandidate[] = []
-    const dfs = (edgeIdx: number, chosenPools: PoolRawData[]) => {
-        if (edgeIdx === edges.length) {
-            results.push({
-                tokenPath,
-                indexPath: chosenPools.map((p) => p.index),
-                pools: chosenPools,
-            })
-            return
-        }
-        for (const pool of edges[edgeIdx]) {
-            dfs(edgeIdx + 1, [...chosenPools, pool])
-        }
-    }
-    dfs(0, [])
-    return results
+    const route = buildRouteWithPoolFallback(
+        tokenPath,
+        allPools,
+        addressToCanonical
+    )
+    return route ? [route] : []
 }
-
-/** 单次报价最多模拟的路径数，避免候选爆炸导致 RPC 过多 */
-const MAX_QUOTE_CANDIDATES = 8
 
 const MIN_SQRT_RATIO = 4295128739n
 const MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342n
@@ -218,6 +249,7 @@ function getSqrtPriceLimitX96(
         : MAX_SQRT_RATIO - 1n
 }
 
+//获取池子swap block原因
 function getSwapBlockReason(
     canonicalIn: string,
     pool: PoolRawData,
@@ -234,25 +266,38 @@ function getSwapBlockReason(
     return null
 }
 
+//获取交易路径swap block原因
 function getRouteSwapBlockReason(
     route: RouteCandidate,
     addressToCanonical: Map<string, Address>
 ): string | null {
-    for (let i = 0; i < route.pools.length; i++) {
-        const reason = getSwapBlockReason(
-            route.tokenPath[i],
-            route.pools[i],
-            addressToCanonical
-        )
-        if (reason) return reason
-    }
-    return null
-}
+    const hopCounts = route.hopPoolCounts
+    let offset = 0
 
-function isRouteFullyInRange(route: RouteCandidate): boolean {
-    return route.pools.every(
-        (p) => p.tick > p.tickLower && p.tick < p.tickUpper
-    )
+    for (let hop = 0; hop < hopCounts.length; hop++) {
+        const canonicalIn = route.tokenPath[hop]
+        const hopPools = route.pools.slice(offset, offset + hopCounts[hop])
+        const hasSwappable = hopPools.some((p) =>
+            //判断池子是否可swap
+            isPoolSwappable(canonicalIn, p, addressToCanonical)
+        )
+
+        if (!hasSwappable) {
+            for (const pool of hopPools) {
+                const reason = getSwapBlockReason(
+                    canonicalIn,
+                    pool,
+                    addressToCanonical
+                )
+                if (reason) return reason
+            }
+            return '该路径所有池子均不可兑换'
+        }
+
+        offset += hopCounts[hop]
+    }
+
+    return null
 }
 
 function filterSwappableRoutes(
@@ -260,9 +305,7 @@ function filterSwappableRoutes(
     addressToCanonical: Map<string, Address>
 ): RouteCandidate[] {
     return routes.filter(
-        (route) =>
-            !getRouteSwapBlockReason(route, addressToCanonical) &&
-            isRouteFullyInRange(route)
+        (route) => !getRouteSwapBlockReason(route, addressToCanonical)
     )
 }
 
@@ -274,16 +317,6 @@ function extractErrorMessage(error: unknown): string {
     return String(error)
 }
 
-function minRouteLiquidity(route: RouteCandidate): number {
-    return Math.min(...route.pools.map((p) => Number(p.liquidity)))
-}
-
-function inRangePoolCount(route: RouteCandidate): number {
-    return route.pools.filter(
-        (p) => p.tick > p.tickLower && p.tick < p.tickUpper
-    ).length
-}
-
 /** 过滤边界池产生的 0 报价或极端价格比（如 100 换出需 1e21 输入） */
 function isReasonableQuoteRatio(amountIn: bigint, amountOut: bigint): boolean {
     if (amountIn <= 0n || amountOut <= 0n) return false
@@ -293,18 +326,12 @@ function isReasonableQuoteRatio(amountIn: bigint, amountOut: bigint): boolean {
     return true
 }
 
-const LIQUIDITY_TIER_FRACTION = 0.1
-
 function pickBestExactInputQuote(
     results: { route: RouteCandidate; out: bigint }[],
     amountIn: bigint
 ): { route: RouteCandidate; out: bigint } | undefined {
     const valid = results.filter((r) => isReasonableQuoteRatio(amountIn, r.out))
-    if (!valid.length) return undefined
-    const maxLiq = Math.max(...valid.map((r) => minRouteLiquidity(r.route)))
-    const liqFloor = maxLiq * LIQUIDITY_TIER_FRACTION
-    const tier = valid.filter((r) => minRouteLiquidity(r.route) >= liqFloor)
-    return tier.reduce<{ route: RouteCandidate; out: bigint } | undefined>(
+    return valid.reduce<{ route: RouteCandidate; out: bigint } | undefined>(
         (best, cur) => (!best || cur.out > best.out ? cur : best),
         undefined
     )
@@ -317,45 +344,11 @@ function pickBestExactOutputQuote(
     const valid = results.filter((r) =>
         isReasonableQuoteRatio(r.amountInNeeded, amountOut)
     )
-    if (!valid.length) return undefined
-    const maxLiq = Math.max(...valid.map((r) => minRouteLiquidity(r.route)))
-    const liqFloor = maxLiq * LIQUIDITY_TIER_FRACTION
-    const tier = valid.filter((r) => minRouteLiquidity(r.route) >= liqFloor)
-    return tier.reduce<{ route: RouteCandidate; amountInNeeded: bigint } | undefined>(
+    return valid.reduce<{ route: RouteCandidate; amountInNeeded: bigint } | undefined>(
         (best, cur) =>
             !best || cur.amountInNeeded < best.amountInNeeded ? cur : best,
         undefined
     )
-}
-
-function compareRoutePriority(a: RouteCandidate, b: RouteCandidate): number {
-    const inRangeDiff = inRangePoolCount(b) - inRangePoolCount(a)
-    if (inRangeDiff !== 0) return inRangeDiff
-    if (a.tokenPath.length !== b.tokenPath.length) {
-        return a.tokenPath.length - b.tokenPath.length
-    }
-    return minRouteLiquidity(b) - minRouteLiquidity(a)
-}
-
-function pickHeuristicBestRoute(candidates: RouteCandidate[]): RouteCandidate | undefined {
-    if (!candidates.length) return undefined
-    return [...candidates].sort(compareRoutePriority)[0]
-}
-
-/** 报价前裁剪候选路径：优先短路径 + 高流动性，减少 RPC 次数 */
-function pruneRouteCandidatesForQuote(
-    candidates: RouteCandidate[],
-    preferred?: RouteCandidate
-): RouteCandidate[] {
-    const sorted = [...candidates].sort(compareRoutePriority)
-    const pruned =
-        sorted.length <= MAX_QUOTE_CANDIDATES
-            ? sorted
-            : sorted.slice(0, MAX_QUOTE_CANDIDATES)
-    if (preferred && !pruned.some((r) => r.indexPath.join(',') === preferred.indexPath.join(','))) {
-        return [preferred, ...pruned.slice(0, MAX_QUOTE_CANDIDATES - 1)]
-    }
-    return pruned
 }
 
 async function quoteExactInputAmount(
@@ -463,23 +456,25 @@ export default function Swap() {
     const config = useConfig()
     const { isConnected, address } = useAccount()
 
+    //获取所有交易对
     const { data: pairs, isLoading: pairsLoading } = useReadContract({
         abi: PoolManagerAbi,
         address: PoolManagerAddress,
         functionName: 'getPairs',
         query: { enabled: isConnected },
     })
-
+    //获取所有池子
     const { data: poolsRaw, isLoading: poolsLoading } = useReadContract({
         abi: PoolManagerAbi,
         address: PoolManagerAddress,
         functionName: 'getAllPools',
         query: { enabled: isConnected },
     })
-
+    //转换池子数据格式
     const allPools = useMemo(() => normalizePools(poolsRaw), [poolsRaw])
+    //获取所有交易对
     const pairList = useMemo(() => (pairs as Pair[] | undefined) ?? [], [pairs])
-
+    //获取所有token地址
     const tokenAddresses = useMemo(() => {
         if (!pairList.length) return [] as Address[]
         // 地址仅大小写不同时应视为同一 token，否则下拉会出现重复 symbol
@@ -493,6 +488,7 @@ export default function Swap() {
         return Array.from(byLower.values())
     }, [pairList])
 
+    //批量读取合约数据，获取symbol
     const { data: symbolResults } = useReadContracts({
         contracts: tokenAddresses.map((addr) => ({
             address: addr,
@@ -501,7 +497,7 @@ export default function Swap() {
         })),
         query: { enabled: tokenAddresses.length > 0 },
     })
-
+    //生成下拉选项
     const { tokenOptions, addressToCanonical, symbolToAddresses } = useMemo(() => {
         const entries = tokenAddresses.map((addr, i) => ({
             addr,
@@ -546,7 +542,9 @@ export default function Swap() {
             symbolToAddresses: addressesBySymbol,
         }
     }, [tokenAddresses, symbolResults, allPools])
+    //构建交易对列表
 
+    //构建交易对列表
     const canonicalPairList = useMemo(
         () => buildCanonicalPairList(pairList, addressToCanonical),
         [pairList, addressToCanonical]
@@ -653,11 +651,6 @@ export default function Swap() {
     const routerConfigured =
         SwapRouterAddress !== '0x0000000000000000000000000000000000000000'
 
-    const heuristicRoute = useMemo(
-        () => pickHeuristicBestRoute(routeCandidates),
-        [routeCandidates]
-    )
-
     const resetQuoteState = useCallback(() => {
         setQuoteMode(null)
         setBestRoute(undefined)
@@ -687,13 +680,12 @@ export default function Swap() {
             setQuoteError('支付数量格式不正确')
             return
         }
-
+        //过滤可用的交易路径
         const swappableRoutes = filterSwappableRoutes(routeCandidates, addressToCanonical)
         if (!swappableRoutes.length) {
-            const blockReason =
-                heuristicRoute
-                    ? getRouteSwapBlockReason(heuristicRoute, addressToCanonical)
-                    : null
+            const blockReason = routeCandidates[0]
+                ? getRouteSwapBlockReason(routeCandidates[0], addressToCanonical)
+                : null
             setQuoteError(
                 blockReason ?? '该兑换方向在池子价格区间外，请反向兑换或等待价格回到区间内'
             )
@@ -703,12 +695,8 @@ export default function Swap() {
         setIsQuoting(true)
         setQuoteError('')
         try {
-            const candidatesToQuote = pruneRouteCandidatesForQuote(
-                swappableRoutes,
-                heuristicRoute
-            )
             const quoteResults = await Promise.allSettled(
-                candidatesToQuote.map(async (route) => {
+                swappableRoutes.map(async (route) => {
                     const out = await quoteExactInputAmount(
                         config,
                         route,
@@ -752,7 +740,6 @@ export default function Swap() {
         selectedTokenOut,
         amountIn,
         routeCandidates,
-        heuristicRoute,
         decimalsIn,
         decimalsOut,
         config,
@@ -786,10 +773,9 @@ export default function Swap() {
 
         const swappableRoutes = filterSwappableRoutes(routeCandidates, addressToCanonical)
         if (!swappableRoutes.length) {
-            const blockReason =
-                heuristicRoute
-                    ? getRouteSwapBlockReason(heuristicRoute, addressToCanonical)
-                    : null
+            const blockReason = routeCandidates[0]
+                ? getRouteSwapBlockReason(routeCandidates[0], addressToCanonical)
+                : null
             setQuoteError(
                 blockReason ?? '该兑换方向在池子价格区间外，请反向兑换或等待价格回到区间内'
             )
@@ -799,12 +785,8 @@ export default function Swap() {
         setIsQuoting(true)
         setQuoteError('')
         try {
-            const candidatesToQuote = pruneRouteCandidatesForQuote(
-                swappableRoutes,
-                heuristicRoute
-            )
             const quoteResults = await Promise.allSettled(
-                candidatesToQuote.map(async (route) => {
+                swappableRoutes.map(async (route) => {
                     const amountInNeeded = await quoteExactOutputAmount(
                         config,
                         route,
@@ -848,7 +830,6 @@ export default function Swap() {
         selectedTokenOut,
         amountOut,
         routeCandidates,
-        heuristicRoute,
         decimalsIn,
         decimalsOut,
         config,

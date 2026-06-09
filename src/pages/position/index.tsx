@@ -4,7 +4,7 @@
  */
 import DataTable from '../../components/table'
 import { poscolumns } from '../../tableinfo/tableinfo'
-import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PositionManagerAbi } from '../../abi/PositionManager'
 import { PoolManagerAbi } from '../../abi/PoolManager'
 import {
@@ -19,6 +19,8 @@ import {
     normalizePosition,
     PositionData,
     normalizePools,
+    tickToHumanPrice,
+    sqrtPriceX96ToHumanPrice,
     type PoolRawData,
 } from '../../utils/coomputer'
 import { erc20Abi, type Address, maxUint256, parseUnits } from 'viem'
@@ -50,12 +52,11 @@ function tokenSymbol(addr: Address, tokenOptions: TokenOption[]): string {
     )
 }
 /** 从 pool 数据计算费率、价格区间、当前价格（弹窗详情区展示） */
-function getPoolPriceInfo(pool: PoolRawData) {
+function getPoolPriceInfo(pool: PoolRawData, decimals0: number, decimals1: number) {
     const feePercent = (pool.fee / 10000).toFixed(2) + '%'
-    const tickLowerPrice = (1.0001 ** pool.tickLower).toFixed(2)
-    const tickUpperPrice = (1.0001 ** pool.tickUpper).toFixed(2)
-    const Q96 = 2 ** 96
-    const currentPrice = ((Number(pool.sqrtPriceX96) / Q96) ** 2).toFixed(2)
+    const tickLowerPrice = tickToHumanPrice(pool.tickLower, decimals0, decimals1, 2)
+    const tickUpperPrice = tickToHumanPrice(pool.tickUpper, decimals0, decimals1, 2)
+    const currentPrice = sqrtPriceX96ToHumanPrice(pool.sqrtPriceX96, decimals0, decimals1)
     return { feePercent, tickLowerPrice, tickUpperPrice, currentPrice }
 }
 /** 选池下拉文案：仅 index + 币对 */
@@ -65,7 +66,7 @@ function formatPoolOptionLabel(pool: PoolRawData, tokenOptions: TokenOption[]): 
     return `[index=${pool.index}] ${sym0}/${sym1}`
 }
 /** 链上交易步骤，用于 approve / mint 串行 */
-type TxStep = 'idle' | 'approve' | 'mint' | 'confirm' | 'approve0' | 'approve1'
+type TxStep = 'idle' | 'mint' | 'approve0' | 'approve1'
 export default function Position() {
     // --- 弹窗表单 state ---
     const [selectedToken0, setSelectedToken0] = useState('')
@@ -77,8 +78,11 @@ export default function Position() {
     const [txStep, setTxStep] = useState<TxStep>('idle')
     /** approve / mint 串行过程中保存本次存入数量，交易确认后继续流程 */
     const pendingAmountSRef = useRef<{ amount0: bigint; amount1: bigint } | null>(null)
+
+    //判断链接状态和钱包地址
     const { isConnected, address } = useAccount()
-    // --- 读链：仓位列表 ---
+
+    // 获取所有仓位信息
     const { data: positions, isLoading, refetch: refetchPositions } = useReadContract({
         abi: PositionManagerAbi,
         address: PositionManagerAddress,
@@ -87,7 +91,7 @@ export default function Position() {
             enabled: isConnected,
         },
     })
-    // --- 读链：已注册交易对，供 token 下拉 ---
+    // 获取所有交易对
     const { data: pairs, isLoading: pairsLoading } = useReadContract({
         abi: PoolManagerAbi,
         address: PoolManagerAddress,
@@ -96,7 +100,7 @@ export default function Position() {
             enabled: isConnected,
         },
     })
-    // --- 读链：全部池子，用于按 token0+token1 过滤并选 index ---
+    // 获取所有池子 
     const { data: poolsRaw, isLoading: poolsLoading, refetch: refetchPools } = useReadContract({
         abi: PoolManagerAbi,
         address: PoolManagerAddress,
@@ -105,8 +109,13 @@ export default function Position() {
             enabled: isConnected,
         },
     })
+
+    //转换池子数据格式
     const allPools = useMemo(() => normalizePools(poolsRaw), [poolsRaw])
+    //获取所有交易对
     const pairList = useMemo(() => (pairs as Pair[] | undefined) ?? [], [pairs])
+
+    // ？？
     // 从 pairs 收集不重复 token 地址，用于批量读 symbol
     const tokenAddresses = useMemo(() => {
         if (!pairList.length) return [] as Address[]
@@ -117,6 +126,8 @@ export default function Position() {
         })
         return Array.from(set).map((a) => a as Address)
     }, [pairList])
+
+    //批量读取合约数据
     const { data: symbolResults } = useReadContracts({
         contracts: tokenAddresses.map((address) => ({
             address,
@@ -125,7 +136,7 @@ export default function Position() {
         })),
         query: { enabled: tokenAddresses.length > 0 },
     })
-    // 地址 → symbol 映射
+    /** 生成下拉选项：label是symbol，value是合约地址 */
     const tokenOptions = useMemo<TokenOption[]>(() => {
         return tokenAddresses.map((addr, i) => {
             const symbol =
@@ -135,6 +146,7 @@ export default function Position() {
             return { label: symbol, value: addr }
         })
     }, [tokenAddresses, symbolResults])
+
     // 合约要求 token0 < token1，下拉只列 pair 里作为 token0 的地址
     const token0Options = useMemo(() => {
         if (!pairList.length) return [] as TokenOption[]
@@ -144,6 +156,7 @@ export default function Position() {
             return opt ?? { label: addr, value: addr as Address }
         })
     }, [pairList, tokenOptions])
+
     // 选定 token0 后，只展示与之配对的 token1
     const token1Options = useMemo(() => {
         if (!selectedToken0 || !pairList.length) return [] as TokenOption[]
@@ -156,6 +169,7 @@ export default function Position() {
                 return opt ?? { label: p.token1, value: p.token1 }
             })
     }, [selectedToken0, pairList, tokenOptions])
+
     // 同一币对可有多个 pool（不同 fee / tick），用 index 区分
     const matchedPools = useMemo(() => {
         if (!selectedToken0 || !selectedToken1) return [] as PoolRawData[]
@@ -165,6 +179,8 @@ export default function Position() {
                 p.token1.toLowerCase() === selectedToken1.toLowerCase()
         )
     }, [allPools, selectedToken0, selectedToken1])
+
+    //生成池子下拉选项
     const poolOptions = useMemo<PoolOption[]>(() => {
         return matchedPools.map((pool) => ({
             value: pool.index,
@@ -172,15 +188,12 @@ export default function Position() {
             label: formatPoolOptionLabel(pool, tokenOptions),
         }))
     }, [matchedPools, tokenOptions])
+
     /** mint 时传入的 index，须与 getAllPools 返回一致 */
     const selectedPool = useMemo(() => {
         if (selectedPoolIndex === '') return undefined
         return matchedPools.find((p) => p.index === selectedPoolIndex)
     }, [matchedPools, selectedPoolIndex])
-    const selectedPoolPriceInfo = useMemo(
-        () => (selectedPool ? getPoolPriceInfo(selectedPool) : null),
-        [selectedPool]
-    )
     // 选中 pool 后读 decimals + allowance(owner, PositionManager)
     const { data: tokenMetaResults, refetch: refetchAllowance } = useReadContracts({
         contracts:
@@ -216,11 +229,17 @@ export default function Position() {
     })
     const decimals0 = Number(tokenMetaResults?.[0]?.result ?? 18)
     const decimals1 = Number(tokenMetaResults?.[1]?.result ?? 18)
+    /** 选中池子后计算弹窗展示的费率、价格区间、当前价格 */
+    const selectedPoolPriceInfo = useMemo(
+        () => (selectedPool ? getPoolPriceInfo(selectedPool, decimals0, decimals1) : null),
+        [selectedPool, decimals0, decimals1]
+    )
     const allowance0 = tokenMetaResults?.[2]?.status === 'success'
         ? (tokenMetaResults[2].result as bigint) : 0n
     const allowance1 = tokenMetaResults?.[3]?.status === 'success'
         ? (tokenMetaResults[3].result as bigint) : 0n
-    // 按当前钱包地址过滤仓位；liquidity 与 owed 均为 0 的视为已退出，不展示
+
+    // 过滤，展示自己的仓位和有待领取的仓位和有流动性的仓位
     const myPositions = useMemo(() => {
         if (!address || !positions) return []
         return (positions as PositionRawData[]).filter((pos) => {
@@ -338,6 +357,9 @@ export default function Position() {
         },
         [selectedPool, address, approveToken0, approveToken1, mitLiquidity]
     )
+    /**
+     * 销毁指定仓位（Burn），从池子取回流动性。
+     */
     const burnPosition = useCallback((item: { id: string | number | bigint }) => {
         if (!isConnected) {
             alert('请先连接钱包')
@@ -350,6 +372,9 @@ export default function Position() {
             args: [BigInt(item.id)],
         })
     }, [isConnected, writePositionAction])
+    /**
+     * 领取指定仓位累积的手续费及 tokensOwed（Collect）。
+     */
     const collectPosition = useCallback((item: { id: string | number | bigint }) => {
         if (!isConnected || !address) {
             alert('请先连接钱包')
@@ -362,7 +387,9 @@ export default function Position() {
             args: [BigInt(item.id), address],
         })
     }, [isConnected, address, writePositionAction])
-    /** 点击「创建」：校验 → parseUnits → 进入 approve/mint 流程 */
+    /**
+     * 弹窗「创建」按钮入口：校验表单 → 转换数量 → 进入 approve/mint 串行流程。
+     */
     const addPosition = () => {
         if (!isConnected || !address) {
             alert('请先连接钱包')
@@ -382,6 +409,7 @@ export default function Position() {
         }
         if (isSubmitting) return
         try {
+            //表单校验，格式转换
             const { amount0Desired, amount1Desired } = parseDesiredAmount()
             continueAddPositionFlow(amount0Desired, amount1Desired)
         } catch (e) {
@@ -414,12 +442,15 @@ export default function Position() {
             alert('添加流动性成功')
         }
     }, [isTxSuccess, txStep, continueAddPositionFlow, refetchPositions, refetchPools])
+    /** Burn / Collect 交易确认成功后，刷新仓位与池子列表 */
     useEffect(() => {
         if (!isPositionActionSuccess) return
         refetchPositions()
         refetchPools()
         alert('操作成功')
     }, [isPositionActionSuccess, refetchPositions, refetchPools])
+
+    /** 池子下拉框的占位提示文案，随选择进度动态变化 */
     const poolSelectPlaceholder = !selectedToken1
         ? '请先选择 token1'
         : poolsLoading
@@ -427,6 +458,7 @@ export default function Position() {
             : poolOptions.length === 0
                 ? '该币对暂无池子，请先去 Pool 页建池'
                 : '请选择池子'
+    /** 调试日志：输出用户在下拉框中选中的 token 名称与合约地址 */
     const logSelectedTokenAddress = useCallback((selectedAddress: string) => {
         if (!selectedAddress) return
         const selectedOption = tokenOptions.find(
